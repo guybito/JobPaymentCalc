@@ -1,0 +1,75 @@
+{
+  "params": {
+    "HOURLY_WAGE": 65.0,
+    "EVENING_BONUS": 0.2,
+    "NIGHT_BONUS": 0.3,
+    "WEEKEND_BONUS": 0.5,
+    "HOLIDAY_BONUS": 0.5,
+    "DAILY_TRAVEL": 22.0,
+    "SIBUS_MONTHLY": 450.0,
+    "OVERTIME_T1_BONUS": 0.25,
+    "OVERTIME_T2_BONUS": 0.5,
+    "DAILY_REGULAR_HOURS": 8.0,
+    "DAILY_T1_HOURS": 2.0,
+    "CREDIT_POINTS": 2.25,
+    "CREDIT_POINT_VALUE": 235.0,
+    "TAX_BRACKETS": [
+      [
+        6790,
+        0.1
+      ],
+      [
+        9720,
+        0.14
+      ],
+      [
+        15760,
+        0.2
+      ],
+      [
+        21700,
+        0.31
+      ],
+      [
+        45180,
+        0.35
+      ],
+      [
+        Infinity,
+        0.47
+      ]
+    ],
+    "NI_THRESHOLD": 7570.0,
+    "NI_LOW": 0.004,
+    "NI_HIGH": 0.07,
+    "HEALTH_LOW": 0.031,
+    "HEALTH_HIGH": 0.05,
+    "EMPLOYEE_PENSION_RATE": 0.07,
+    "PENSION_BASE_MODE": "wage_only"
+  },
+  "gross_components": {
+    "wage_components": 12741.05,
+    "travel_sum": 308.0,
+    "sibus_monthly": 450.0,
+    "monthly_gross_taxable": 13499.05,
+    "pension_base": 12741.05
+  },
+  "deductions": {
+    "employee_pension": 891.87,
+    "ni": 445.31,
+    "health": 531.12,
+    "income_tax_before": 1845.01,
+    "income_tax_after_credit": 1316.26,
+    "credit_relief": 528.75
+  },
+  "net": 10314.49,
+  "hours_summary": {
+    "hours_total": 129.58333333333334,
+    "hours_evening": 67.36666666666667,
+    "hours_night": 15.0,
+    "hours_weekend": 31.416666666666664,
+    "hours_holiday": 0.0,
+    "hours_ot_t1": 15.233333333333334,
+    "hours_ot_t2": 2.3499999999999996
+  }
+}
