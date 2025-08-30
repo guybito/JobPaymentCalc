@@ -1,348 +1,841 @@
-import io
-import re
-import math
-import pdfplumber
+# app.py
+# -*- coding: utf-8 -*-
+import io, math, json, re
 import pandas as pd
-from datetime import datetime, timedelta, time
 import streamlit as st
+from datetime import datetime, timedelta, time
 
-st.set_page_config(page_title="חישוב שכר אוטומטי", page_icon="💸", layout="wide")
+# =========================
+# Page config
+# =========================
+st.set_page_config(page_title="מחשבון שכר", page_icon="💸", layout="wide")
 
-# ---------- Utils ----------
-HE_DAY_NAMES = ["ראשון","שני","שלישי","רביעי","חמישי","שישי","שבת"]
-DATE_RE = re.compile(r"(\d{2}/\d{2}/\d{4})")
+# =========================
+# Hebrew helpers (PDF normalization)
+# =========================
+HEB_ONLY = re.compile(r'^[\u0590-\u05FF\s\.\-]+$')
 
-def parse_hhmm(s: str):
-    try:
-        return datetime.strptime(s, "%H:%M").time()
-    except Exception:
-        return None
+EXPECTED_HEB_WORDS = {
+    "ראשון","שני","שלישי","רביעי","חמישי","שישי","שבת",
+    "אין","דיווח","נוכחות","מחלה","חג","ערב","עבודה","מנוחה","יום"
+}
 
-def parse_date_he(s: str):
-    return datetime.strptime(s.strip(), "%d/%m/%Y").date()
+def hebrew_only(s: str) -> bool:
+    return isinstance(s, str) and bool(HEB_ONLY.match(s.strip())) and any('\u0590' <= ch <= '\u05FF' for ch in s)
 
-def to_dt(date_obj, t):
-    return datetime.combine(date_obj, t)
+def reverse_hebrew_if_needed(s: str) -> str:
+    """היפוך פשוט – יופעל רק עבור טקסט עברי "טהור" כשנחליט שצריך."""
+    if hebrew_only(s):
+        return s[::-1]
+    return s
 
-def extract_entries_from_pdf(pdf_bytes: bytes):
-    """
-    מפענח את ה-PDF (דו״ח מל״ם), מפריד לבלוקים יומיים.
-    מוסיף flags לזיהוי 'חג' / 'ערב חג' אם מופיע במלל של אותו יום.
-    """
-    text = ""
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text() or ""
-            text += "\n" + t
-
-    parts = DATE_RE.split(text)
-    entries = []
-    for i in range(1, len(parts), 2):
-        date_str = parts[i]
-        block = parts[i+1]
-        try:
-            date_obj = datetime.strptime(date_str, "%d/%m/%Y").date()
-        except Exception:
+def detect_column_orientation(series: pd.Series) -> str:
+    normal_hits = 0
+    reversed_hits = 0
+    sample = (x for x in series.dropna().astype(str).head(200))
+    for s in sample:
+        s_stripped = s.strip()
+        if not s_stripped:
             continue
+        s_rev = s_stripped[::-1]
+        for w in EXPECTED_HEB_WORDS:
+            if w in s_stripped:
+                normal_hits += 1
+            if w in s_rev:
+                reversed_hits += 1
+    return "reversed" if reversed_hits > normal_hits + 1 else "normal"
 
-        dow_he = ""
-        for name in HE_DAY_NAMES:
-            if name in block:
-                dow_he = name
-                break
+def apply_hebrew_correction(df: pd.DataFrame, mode: str = "auto") -> pd.DataFrame:
+    df2 = df.copy()
+    obj_cols = [c for c in df2.columns if df2[c].dtype == object]
+    if mode == "off":
+        return df2
+    for c in obj_cols:
+        if mode == "on":
+            df2[c] = df2[c].apply(reverse_hebrew_if_needed)
+        else:  # auto
+            orient = detect_column_orientation(df2[c])
+            if orient == "reversed":
+                df2[c] = df2[c].apply(reverse_hebrew_if_needed)
+    return df2
 
-        status = ""
-        if re.search(r"מחלה", block):
-            status = "מחלה"
-        elif re.search(r"אין\s+דיווח\s+נוכחות", block):
-            status = "אין דיווח"
-
-        # זיהוי אזכורי חג/ערב חג בטקסט של אותו יום (אם הדו״ח מציין זאת)
-        is_hag_text = bool(re.search(r"\bחג\b", block))
-        is_erev_hag_text = bool(re.search(r"\bערב\s*חג\b", block))
-
-        times = re.findall(r"\b(\d{2}:\d{2})\b", block)
-        parsed = [parse_hhmm(t) for t in times if parse_hhmm(t)]
-
-        first_in = min(parsed) if parsed else None
-        last_out = max(parsed) if parsed else None
-
-        entries.append(dict(
-            date=date_obj, dow_he=dow_he, status=status,
-            first_in=first_in, last_out=last_out,
-            is_hag_text=is_hag_text, is_erev_hag_text=is_erev_hag_text
-        ))
-    return entries
-
-def segment_hours(date_obj, start_t, end_t,
-                  enable_weekend_holiday=False,
-                  holiday_dates=None, erev_holiday_dates=None):
-    """
-    מחלק טווח עבודה לקטגוריות:
-    - regular   (רגיל)
-    - evening   (16:00–24:00) +20%
-    - night     (00:00–07:30) +30%
-    - weekend   (+50%) עבור שבת/חג בהתאם לכללים:
-        * שישי מ-16:00 ועד שבת 24:00 + לילה שאחרי שבת עד 07:30 של ראשון
-        * יום חג מלא +50%
-        * ערב חג מ-16:00 ועד 07:30 שלמחרת +50%
-    אם enable_weekend_holiday=False, לא מחילים את 50% אלא רק ערב/לילה.
-    """
-    if not start_t or not end_t:
-        return dict(regular=0.0, evening=0.0, night=0.0, weekend=0.0)
-
-    holiday_dates = holiday_dates or set()
-    erev_holiday_dates = erev_holiday_dates or set()
-
-    start = to_dt(date_obj, start_t)
-    end = to_dt(date_obj, end_t)
-    if end <= start:
-        end += timedelta(days=1)
-
-    step = timedelta(minutes=15)
-    buckets = dict(regular=0.0, evening=0.0, night=0.0, weekend=0.0)
-
-    t = start
-    while t < end:
-        dow = t.weekday()  # Mon=0 ... Sun=6
-        tt = t.time()
-        d = t.date()
-
-        # חלונות קבועים:
-        is_night = time(0,0) <= tt < time(7,30)
-        is_evening = time(16,0) <= tt < time(23,59,59)
-
-        # לוגיקת שבת/חג
-        is_weekendish_50 = False
-        if enable_weekend_holiday:
-            # שבת וחלון סביב שבת
-            if (dow == 4 and tt >= time(16,0)) or (dow == 5) or (dow == 6 and tt < time(7,30)):
-                is_weekendish_50 = True
-            # חג מלא
-            if d in holiday_dates:
-                is_weekendish_50 = True
-            # ערב חג: מ-16:00 ועד 07:30 שלמחרת
-            if d in erev_holiday_dates and (tt >= time(16,0) or tt < time(7,30)):
-                is_weekendish_50 = True
-
-        if is_weekendish_50:
-            cat = "weekend"
-        else:
-            if is_night:
-                cat = "night"
-            elif is_evening:
-                cat = "evening"
-            else:
-                cat = "regular"
-
-        buckets[cat] += step.total_seconds()/3600.0
-        t += step
-
-    return buckets
-
-def compute_pay(entries, hourly_rate=65.0, travel_per_day=22.6,
-                sick_by_avg_day=True, fixed_sick_day_hours=8.5,
-                enable_weekend_holiday=False,
-                manual_holidays=None, manual_erev_holidays=None):
-    """
-    חישוב מלא, עם תמיכה באופציית שבת/חג 50%:
-    - manual_holidays: set של תאריכי חג (date)
-    - manual_erev_holidays: set של תאריכי ערב חג (date)
-    בנוסף, אם ה-PDF עצמו מציין 'חג/ערב חג' ביום מסוים, נתייחס לכך אוטומטית.
-    """
-    manual_holidays = set(manual_holidays or [])
-    manual_erev_holidays = set(manual_erev_holidays or [])
-
-    # פירוק רשומות
-    worked = []
-    sick = []
-    for e in entries:
-        if e["status"] == "מחלה":
-            sick.append(e)
-            continue
-        if e["status"] == "אין דיווח":
-            continue
-
-        # בנה סטים ליום הזה: חג/ערב חג ידניים או מזוהים מהדו״ח
-        day_is_hag = e.get("is_hag_text", False) or (e["date"] in manual_holidays)
-        day_is_erev = e.get("is_erev_hag_text", False) or (e["date"] in manual_erev_holidays)
-
-        worked.append({
-            **e,
-            "day_is_hag": day_is_hag,
-            "day_is_erev": day_is_erev
-        })
-
-    # שעות לפי קטגוריות
-    totals = dict(regular=0.0, evening=0.0, night=0.0, weekend=0.0)
-    per_day_rows = []
-    for e in worked:
-        b = segment_hours(
-            e["date"], e["first_in"], e["last_out"],
-            enable_weekend_holiday=enable_weekend_holiday,
-            holiday_dates={e["date"]} if e["day_is_hag"] else set(),
-            erev_holiday_dates={e["date"]} if e["day_is_erev"] else set()
-        )
-        for k in totals:
-            totals[k] += b[k]
-        per_day_rows.append({
-            "תאריך": e["date"].strftime("%d/%m/%Y"),
-            "יום": e["dow_he"],
-            "כניסה": e["first_in"].strftime("%H:%M") if e["first_in"] else "",
-            "יציאה": e["last_out"].strftime("%H:%M") if e["last_out"] else "",
-            "זוהה חג?": "כן" if e["day_is_hag"] else "",
-            "זוהה ערב חג?": "כן" if e["day_is_erev"] else "",
-            "רגיל": round(b["regular"],2),
-            "ערב (+20%)": round(b["evening"],2),
-            "לילה (+30%)": round(b["night"],2),
-            "שבת/חג (+50%)": round(b["weekend"],2),
-            "סך שעות": round(sum(b.values()),2)
-        })
-
-    reg_h, eve_h, night_h, we_h = totals["regular"], totals["evening"], totals["night"], totals["weekend"]
-    base_hours = reg_h + eve_h + night_h + we_h
-
-    # שכר בסיס + תוספות
-    base_pay = base_hours * hourly_rate
-    premium_pay = eve_h*hourly_rate*0.20 + night_h*hourly_rate*0.30 + we_h*hourly_rate*0.50
-
-    # נסיעות
-    workdays_count = len([e for e in worked if e["first_in"] and e["last_out"]])
-    travel_pay = workdays_count * travel_per_day
-
-    # מחלה – לפי חוק
-    if sick_by_avg_day:
-        avg_daily_hours = (base_hours / workdays_count) if workdays_count else 0.0
-        sick_day_hours = avg_daily_hours
-    else:
-        sick_day_hours = fixed_sick_day_hours
-
-    sick_sorted = sorted(sick, key=lambda x: x["date"])
-    sick_hours_total = 0.0
-    for i, _ in enumerate(sick_sorted, start=1):
-        if i == 1:
-            sick_hours_total += 0.0
-        elif i in (2,3):
-            sick_hours_total += sick_day_hours * 0.5
-        else:
-            sick_hours_total += sick_day_hours * 1.0
-    sick_pay = sick_hours_total * hourly_rate
-
-    gross_total = base_pay + premium_pay + travel_pay + sick_pay
-
-    # טבלאות להצגה/הורדה
-    df_days = pd.DataFrame(per_day_rows)
-    summary = pd.DataFrame({
-        "קטגוריה":["רגיל","ערב (+20%)","לילה (+30%)","שבת/חג (+50%)","סה״כ"],
-        "שעות":[round(reg_h,2), round(eve_h,2), round(night_h,2), round(we_h,2), round(base_hours,2)],
-        "שכר בסיס (₪)":[round(reg_h*hourly_rate,2), round(eve_h*hourly_rate,2), round(night_h*hourly_rate,2), round(we_h*hourly_rate,2), round(base_hours*hourly_rate,2)],
-        "תוספת (₪)":[0.0, round(eve_h*hourly_rate*0.20,2), round(night_h*hourly_rate*0.30,2), round(we_h*hourly_rate*0.50,2), round(premium_pay,2)],
-        "תת-סכום (₪)":[round(reg_h*hourly_rate,2), round(eve_h*hourly_rate*1.20,2), round(night_h*hourly_rate*1.30,2), round(we_h*hourly_rate*1.50,2), round(base_pay+premium_pay,2)],
-    })
-
-    meta = {
-        "ימי עבודה": workdays_count,
-        "ימי מחלה": len(sick_sorted),
-        "שעות/יום למחלה": round(sick_day_hours,2),
-        "שכר בסיס": round(base_pay,2),
-        "תוספות משמרת": round(premium_pay,2),
-        "נסיעות": round(travel_pay,2),
-        "שכר מחלה": round(sick_pay,2),
-        "ברוטו משוער": round(gross_total,2),
-    }
-
-    return df_days, summary, meta
-
-# ---------- UI ----------
-st.title("💸 מחשבון שכר אוטומטי לדו״ח נוכחות (מל״ם)")
-st.caption("מעלה דו״ח PDF חודשי, מקבל פירוט יומי, תוספות ערב/לילה/שבת/חגים, נסיעות ומחלה.")
-
-row1 = st.columns(4)
-with row1[0]:
-    hourly_rate = st.number_input("שכר לשעה (₪)", min_value=0.0, step=0.5, value=65.0)
-with row1[1]:
-    travel_per_day = st.number_input("דמי נסיעות ליום (₪)", min_value=0.0, step=0.1, value=22.6)
-with row1[2]:
-    sick_mode = st.selectbox("חישוב בסיס שעות למחלה", ["ממוצע שעות יומיות בפועל", "ערך קבוע (למשל 8.5)"])
-with row1[3]:
-    enable_weekend_holiday = st.checkbox("חשב שבת/חג בתוספת 50% (כולל שישי מ־16:00, ערב חג מ־16:00)", value=True)
-
-fixed_hours = None
-if sick_mode == "ערך קבוע (למשל 8.5)":
-    fixed_hours = st.number_input("שעות ליום מחלה (קבוע)", min_value=0.0, step=0.25, value=8.5)
-
-st.markdown("**חגים ידניים (אופציונלי):** הזן תאריכי חג בפורמט `DD/MM/YYYY` מופרדים בפסיקים.\
- אפשר גם להזין תאריכי *ערב חג* בנפרד.")
-col_h1, col_h2 = st.columns(2)
-with col_h1:
-    manual_holidays_str = st.text_input("תאריכי חג (למשל: 03/10/2025, 04/10/2025)", "")
-with col_h2:
-    manual_erev_holidays_str = st.text_input("תאריכי ערב חג (למשל: 02/10/2025)", "")
-
-def parse_dates_list(s):
-    if not s.strip():
-        return set()
-    items = [x for x in s.split(",") if x.strip()]
-    return {parse_date_he(x) for x in items}
-
-manual_holidays = parse_dates_list(manual_holidays_str)
-manual_erev_holidays = parse_dates_list(manual_erev_holidays_str)
-
-uploaded = st.file_uploader("העלה כאן את דו״ח ה-PDF ממלם", type=["pdf"])
-
-if uploaded:
-    try:
-        pdf_bytes = uploaded.read()
-        entries = extract_entries_from_pdf(pdf_bytes)
-
-        st.subheader("תצוגה מקדימה של הימים שזוהו")
-        preview = pd.DataFrame([{
-            "תאריך": e["date"].strftime("%d/%m/%Y"),
-            "יום": e["dow_he"],
-            "סטטוס": e["status"] or "עבודה",
-            "זוהה חג בטקסט?": "כן" if e["is_hag_text"] else "",
-            "זוהה ערב חג בטקסט?": "כן" if e["is_erev_hag_text"] else "",
-            "כניסה": e["first_in"].strftime("%H:%M") if e["first_in"] else "",
-            "יציאה": e["last_out"].strftime("%H:%M") if e["last_out"] else "",
-        } for e in entries])
-        st.dataframe(preview, use_container_width=True, hide_index=True)
-
-        # חישוב
-        df_days, summary, meta = compute_pay(
-            entries,
-            hourly_rate=hourly_rate,
-            travel_per_day=travel_per_day,
-            sick_by_avg_day=(sick_mode == "ממוצע שעות יומיות בפועל"),
-            fixed_sick_day_hours=(fixed_hours if fixed_hours is not None else 8.5),
-            enable_weekend_holiday=enable_weekend_holiday,
-            manual_holidays=manual_holidays,
-            manual_erev_holidays=manual_erev_holidays
-        )
-
-        st.subheader("🔢 תוצאות")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("ימי עבודה", meta["ימי עבודה"])
-        c2.metric("ימי מחלה", meta["ימי מחלה"])
-        c3.metric("שעות/יום למחלה", meta["שעות/יום למחלה"])
-        c4.metric("ברוטו משוער (₪)", f'{meta["ברוטו משוער"]:,}')
-
-        st.markdown("### פירוט יומי")
-        st.dataframe(df_days, use_container_width=True, hide_index=True)
-
-        st.markdown("### סיכום שעות ותוספות")
-        st.dataframe(summary, use_container_width=True, hide_index=True)
-
-        # הורדות
-        days_csv = df_days.to_csv(index=False).encode("utf-8-sig")
-        summ_csv = summary.to_csv(index=False).encode("utf-8-sig")
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.download_button("⬇️ הורד CSV: פירוט יומי", data=days_csv, file_name="timesheet_per_day.csv", mime="text/csv")
-        with col_b:
-            st.download_button("⬇️ הורד CSV: סיכום שעות", data=summ_csv, file_name="shift_summary.csv", mime="text/csv")
-
-        st.success("החישוב הושלם. ניתן לכוונן חגים/ערב חג דרך השדות למעלה.")
-    except Exception as e:
-        st.error(f"נכשלו פענוח או חישוב: {e}")
+# =========================
+# Theme (force dark)
+# =========================
+base_theme = "dark"
+if base_theme == "dark":
+    PRIMARY = "#A78BFA"
+    ACCENT  = "#34D399"
+    INK     = "#F9FAFB"
+    INK_SOFT= "#E5E7EB"
+    MUTED   = "#94A3B8"
+    CARD_BG = "#111827"
+    BORDER  = "#1F2937"
+    TABLE_BORDER = "#26303F"
+    LINK_HOVER = "#F472B6"
 else:
-    st.info("העלה דו״ח PDF לקבלת חישוב.")
+    PRIMARY = "#4F46E5"
+    ACCENT  = "#10B981"
+    INK     = "#0F172A"
+    INK_SOFT= "#334155"
+    MUTED   = "#64748B"
+    CARD_BG = "#FFFFFF"
+    BORDER  = "#E2E8F0"
+    TABLE_BORDER = "#EEF2F7"
+    LINK_HOVER = "#7C3AED"
+
+st.markdown(f"""
+<style>
+html, body, [class*="css"] {{
+  direction: rtl;
+  text-align: right;
+  color: {INK};
+  font-family: "Rubik","Assistant","Segoe UI",Tahoma,sans-serif;
+}}
+.block-container {{ padding-top: 1rem; }}
+h1, h2, h3 {{ letter-spacing: .3px; }}
+h1 {{ color: {INK}; }}
+h2 {{ color: {INK_SOFT}; }}
+.card {{
+  background: {CARD_BG};
+  border:1px solid {BORDER};
+  border-radius:16px;
+  padding: 18px 18px;
+  box-shadow: 0 6px 16px rgba(2,6,23,.06);
+}}
+.kpi {{
+  border-radius:16px; padding:18px;
+  background: linear-gradient(135deg, rgba(255,255,255,.08) 0%, rgba(248,250,252,.04) 100%);
+  border:1px solid {BORDER};
+}}
+.kpi .label {{ color:{MUTED}; font-size:.9rem; }}
+.kpi .value {{ font-weight:800; font-size:1.45rem; color:{INK}; }}
+.stDataFrame thead tr th, .stDataFrame tbody tr td,
+.stDataEditor thead tr th, .stDataEditor tbody tr td {{
+  border-color:{TABLE_BORDER} !important;
+  color:{INK} !important;
+}}
+.stDataEditor table, .stDataFrame table {{ unicode-bidi: plaintext; }}
+.stDataEditor [contenteditable="true"] {{
+  unicode-bidi: plaintext;
+  text-align: right;
+  color:{INK} !important;
+}}
+.badge {{
+  display:inline-block; padding:.25rem .6rem; border-radius:999px;
+  font-size:.8rem; font-weight:600; background:rgba(79,70,229,.12); color:{PRIMARY};
+}}
+.step {{ display:flex; gap:.5rem; align-items:center; margin:.4rem 0 1rem 0; }}
+.step .num {{
+  width:28px; height:28px; border-radius:999px; display:flex; align-items:center; justify-content:center;
+  background:{PRIMARY}; color:#fff; font-weight:700;
+}}
+.step .title {{ color:{INK}; font-weight:700; }}
+.small {{ font-size:.9rem; color:{MUTED}; }}
+hr {{ border-top:1px solid {BORDER}; }}
+</style>
+""", unsafe_allow_html=True)
+
+# =========================
+# Utilities
+# =========================
+def parse_hhmm(s):
+    if s is None: return None
+    if isinstance(s, float) and math.isnan(s): return None
+    s = str(s).strip()
+    if not s or s in {".","-"}: return None
+    try: return datetime.strptime(s, "%H:%M").time()
+    except: return None
+
+def parse_date(s): return datetime.strptime(str(s), "%d/%m/%Y").date()
+def overlap_minutes(a_start,a_end,b_start,b_end):
+    start=max(a_start,b_start); end=min(a_end,b_end)
+    return max(0,int((end-start).total_seconds()//60))
+def daily_interval(date_obj,t_start,t_end):
+    start=datetime.combine(date_obj,t_start); end=datetime.combine(date_obj,t_end)
+    if t_end<=t_start: end+=timedelta(days=1)
+    return start,end
+def minutes_to_hours(m): return m/60.0
+def money(v): return f"{v:,.2f} ₪".replace(",", ",")
+
+# =========================
+# Defaults / Params
+# =========================
+DEFAULT_PARAMS = {
+    "HOURLY_WAGE": 65.0,
+    "EVENING_BONUS": 0.20, "NIGHT_BONUS": 0.30, "WEEKEND_BONUS": 0.50, "HOLIDAY_BONUS": 0.50,
+    "DAILY_TRAVEL": 22.0, "SIBUS_MONTHLY": 450.0,
+    "SICK_KEYWORD": "מחלה", "NO_ATTENDANCE_KEYWORD": "אין דיווח נוכחות", "HOLIDAY_HINTS": ["חג","ערב חג"],
+    "USE_AVG_HOURS_FOR_SICK": True, "DEFAULT_DAILY_SICK_HOURS": 8.0,
+    "OVERTIME_T1_BONUS": 0.25, "OVERTIME_T2_BONUS": 0.50, "DAILY_REGULAR_HOURS": 8.0, "DAILY_T1_HOURS": 2.0,
+    "CREDIT_POINTS": 2.25, "CREDIT_POINT_VALUE": 235.0,
+    "TAX_BRACKETS": [(6790,0.10),(9720,0.14),(15760,0.20),(21700,0.31),(45180,0.35),(float("inf"),0.47)],
+    "NI_THRESHOLD": 7570.0, "NI_LOW": 0.004, "NI_HIGH": 0.07, "HEALTH_LOW": 0.031, "HEALTH_HIGH": 0.05,
+    "EMPLOYEE_PENSION_RATE": 0.07, "PENSION_BASE_MODE": "wage_only",
+    "OT_BASIS": "Daily + Weekly (max)",
+    "WEEK_START": "Sunday",
+}
+
+# =========================
+# Payroll engine
+# =========================
+def build_processor(params):
+    HOURLY_WAGE=params["HOURLY_WAGE"]; EVENING_BONUS=params["EVENING_BONUS"]; NIGHT_BONUS=params["NIGHT_BONUS"]
+    WEEKEND_BONUS=params["WEEKEND_BONUS"]; HOLIDAY_BONUS=params["HOLIDAY_BONUS"]
+    DAILY_TRAVEL=params["DAILY_TRAVEL"]; SIBUS_MONTHLY=params["SIBUS_MONTHLY"]
+    SICK_KEYWORD=params["SICK_KEYWORD"]; NO_ATTENDANCE_KEYWORD=params["NO_ATTENDANCE_KEYWORD"]; HOLIDAY_HINTS=params["HOLIDAY_HINTS"]
+    USE_AVG_HOURS_FOR_SICK=params["USE_AVG_HOURS_FOR_SICK"]; DEFAULT_DAILY_SICK_HOURS=params["DEFAULT_DAILY_SICK_HOURS"]
+    OVERTIME_T1_BONUS=params["OVERTIME_T1_BONUS"]; OVERTIME_T2_BONUS=params["OVERTIME_T2_BONUS"]
+    DAILY_REGULAR_HOURS=params["DAILY_REGULAR_HOURS"]; DAILY_T1_HOURS=params["DAILY_T1_HOURS"]
+    CREDIT_POINTS=params["CREDIT_POINTS"]; CREDIT_POINT_VALUE=params["CREDIT_POINT_VALUE"]; TAX_BRACKETS=params["TAX_BRACKETS"]
+    NI_THRESHOLD=params["NI_THRESHOLD"]; NI_LOW=params["NI_LOW"]; NI_HIGH=params["NI_HIGH"]; HEALTH_LOW=params["HEALTH_LOW"]; HEALTH_HIGH=params["HEALTH_HIGH"]
+    EMPLOYEE_PENSION_RATE=params["EMPLOYEE_PENSION_RATE"]; PENSION_BASE_MODE=params["PENSION_BASE_MODE"]
+    OT_BASIS=params.get("OT_BASIS","Daily + Weekly (max)")
+    WEEK_START=params.get("WEEK_START","Sunday")
+
+    def is_holiday(t): return isinstance(t,str) and any(h in t for h in HOLIDAY_HINTS)
+    def is_sick(t):    return isinstance(t,str) and (SICK_KEYWORD in t)
+    def is_no_att(t):  return isinstance(t,str) and (NO_ATTENDANCE_KEYWORD in t)
+
+    # -------- FIX 1: forward-fill date/day for split shifts --------
+    def load_attendance_from_csv(csv_df: pd.DataFrame) -> pd.DataFrame:
+        required = ["סה\"כ נוכחות", "שעת יציאה", "שעת כניסה", "סטטוס/הערות", "יום בשבוע", "תאריך"]
+        for c in required:
+            if c not in csv_df.columns:
+                raise ValueError(f"עמודה חסרה בקובץ: {c}")
+        df = csv_df.copy()
+
+        # ניקוי ערכים ריקים/מיותרים בעמודות התאריך והיום
+        for col in ["תאריך", "יום בשבוע"]:
+            if col in df.columns:
+                df[col] = df[col].astype(str).str.strip()
+                df[col] = df[col].replace({"None": pd.NA, "nan": pd.NA, "NaN": pd.NA, "": pd.NA, ".": pd.NA})
+
+        # >>> כאן הקסם: מילוי קדימה כדי ששורה שנייה של אותה משמרת תקבל את התאריך/יום שלמעלה
+        df[["תאריך", "יום בשבוע"]] = df[["תאריך", "יום בשבוע"]].ffill()
+
+        return df.astype(str)
+
+    # ---------------- time buckets ----------------
+    def compute_evening_minutes(start_dt,end_dt):
+        total=0; cur=start_dt
+        while cur<end_dt:
+            day=cur.date(); eve_start,eve_end=daily_interval(day,time(16,0),time(0,0))
+            total+=overlap_minutes(start_dt,end_dt,eve_start,eve_end)
+            cur=datetime.combine(day,time(0,0))+timedelta(days=1)
+        return total
+
+    def compute_night_minutes(start_dt,end_dt):
+        total=0; cur=start_dt
+        while cur<end_dt:
+            day=cur.date(); night_start=datetime.combine(day,time(0,0)); night_end=datetime.combine(day,time(7,30))
+            total+=overlap_minutes(start_dt,end_dt,night_start,night_end)
+            cur=datetime.combine(day,time(0,0))+timedelta(days=1)
+        return total
+
+    def iter_weekend_windows(around_start,around_end):
+        window_start=(around_start - timedelta(days=3)).date()
+        window_end=(around_end + timedelta(days=3)).date()
+        d=window_start
+        while d<=window_end:
+            off=(4 - d.weekday())%7  # Fri=4
+            fri=d+timedelta(days=off)
+            fri_16=datetime.combine(fri,time(16,0))
+            sun=fri+timedelta(days=2); sun_0730=datetime.combine(sun,time(7,30))
+            yield fri_16,sun_0730
+            d+=timedelta(days=7)
+
+    def compute_weekend_minutes(start_dt,end_dt):
+        total=0
+        for w_start,w_end in iter_weekend_windows(start_dt,end_dt):
+            total+=overlap_minutes(start_dt,end_dt,w_start,w_end)
+        return total
+
+    def compute_daily_rows(selected_df: pd.DataFrame):
+        rows=[]
+        for _,r in selected_df.iterrows():
+            status=str(r.get("סטטוס/הערות","") or "").strip()
+            if is_no_att(status): continue
+            try: date=parse_date(str(r["תאריך"]))
+            except: continue
+            t_in=parse_hhmm(r.get("שעת כניסה"))
+            t_out=parse_hhmm(r.get("שעת יציאה"))
+            holiday_flag=is_holiday(status); sick_flag=is_sick(status)
+            if sick_flag:
+                rows.append({"תאריך":date,"סטטוס/הערות":status,"is_sick":True,"holiday":holiday_flag,
+                             "start":None,"end":None,"minutes_total":0,"minutes_evening":0,"minutes_night":0,
+                             "minutes_weekend":0,"minutes_holiday":0,"worked_day":False})
+                continue
+            if not t_in or not t_out: continue
+            start=datetime.combine(date,t_in); end=datetime.combine(date,t_out)
+            if end<=start: end+=timedelta(days=1)
+            minutes_total=int((end-start).total_seconds()//60)
+            if minutes_total<=0: continue
+            minutes_evening=compute_evening_minutes(start,end)
+            minutes_night=compute_night_minutes(start,end)
+            minutes_weekend=compute_weekend_minutes(start,end)
+            minutes_holiday=minutes_total if holiday_flag else 0
+            rows.append({"תאריך":date,"סטטוס/הערות":status,"is_sick":False,"holiday":holiday_flag,
+                        "start":start,"end":end,"minutes_total":minutes_total,"minutes_evening":minutes_evening,
+                        "minutes_night":minutes_night,"minutes_weekend":minutes_weekend,"minutes_holiday":minutes_holiday,
+                        "worked_day":True})
+        return pd.DataFrame(rows).sort_values("תאריך").reset_index(drop=True)
+
+    # OT daily + pay
+    def add_pay_columns(daily_df: pd.DataFrame):
+        df=daily_df.copy(); base=HOURLY_WAGE
+        for k in ["total","evening","night","weekend","holiday"]:
+            df[f"hours_{k}"]=df[f"minutes_{k}"].apply(minutes_to_hours)
+
+        # "בוקר" = כל מה שלא ערב/לילה
+        df["hours_morning"] = (df["hours_total"] - df["hours_evening"] - df["hours_night"]).clip(lower=0)
+
+        df["pay_base"]=df["hours_total"]*base
+        df["pay_evening_bonus"]=df["hours_evening"]*base*EVENING_BONUS
+        df["pay_night_bonus"]=df["hours_night"]*base*NIGHT_BONUS
+        df["pay_weekend_bonus"]=df["hours_weekend"]*base*WEEKEND_BONUS
+        df["pay_holiday_bonus"]=df["hours_holiday"]*base*HOLIDAY_BONUS
+
+        overtime=(df["hours_total"]-params["DAILY_REGULAR_HOURS"]).clip(lower=0)
+        df["hours_ot_t1"]=overtime.clip(upper=params["DAILY_T1_HOURS"])
+        df["hours_ot_t2"]=(overtime-df["hours_ot_t1"]).clip(lower=0)
+        df["pay_overtime_t1"]=df["hours_ot_t1"]*base*OVERTIME_T1_BONUS
+        df["pay_overtime_t2"]=df["hours_ot_t2"]*base*OVERTIME_T2_BONUS
+
+        # -------- FIX 2: נסיעות פעם אחת ליום --------
+        df["travel_pay"]=0.0
+        for d, g in df.groupby("תאריך", sort=False):
+            idx = g.index[(g["worked_day"]) & (~g["is_sick"])].tolist()
+            if idx:
+                df.loc[idx[0], "travel_pay"] = DAILY_TRAVEL
+
+        df["pay_total_day"]=(df["pay_base"]+df["pay_evening_bonus"]+df["pay_night_bonus"]+
+                             df["pay_weekend_bonus"]+df["pay_holiday_bonus"]+
+                             df["pay_overtime_t1"]+df["pay_overtime_t2"]+df["travel_pay"])
+        return df
+
+    # Weekly top-up (42h)
+    def week_period_series(dates, week_start_str):
+        freq = "W-SAT" if week_start_str == "Sunday" else "W-SUN"
+        return pd.to_datetime(dates).dt.to_period(freq)
+
+    def compute_weekly_overtime_topup(daily_df, weekly_threshold=42.0, week_start_str="Sunday"):
+        df = daily_df.copy()
+        df["__week"] = week_period_series(df["תאריך"], week_start_str)
+        df["weekly_topup_125"] = 0.0
+        df["weekly_topup_150"] = 0.0
+        df["hours_regular_day"] = df["hours_total"].clip(upper=params["DAILY_REGULAR_HOURS"])
+
+        for _, g in df.groupby("__week", sort=False):
+            g_sorted = g.sort_values("תאריך")
+            total_reg = float(g_sorted["hours_regular_day"].sum())
+            excess = max(0.0, total_reg - weekly_threshold)
+            if excess <= 0:
+                continue
+            remain = excess
+            for idx in g_sorted.index:
+                if remain <= 0: break
+                take = min(float(df.loc[idx, "hours_regular_day"]), remain)
+                df.loc[idx, "weekly_topup_125"] += take * HOURLY_WAGE * OVERTIME_T1_BONUS
+                remain -= take
+
+        return df.drop(columns="__week")
+
+    # Sick pay
+    def add_sick_pay(daily_df: pd.DataFrame, selected_df: pd.DataFrame):
+        df=daily_df.copy()
+        avg_hours=DEFAULT_DAILY_SICK_HOURS
+        if USE_AVG_HOURS_FOR_SICK:
+            wh=df.loc[df["worked_day"],"hours_total"]
+            if len(wh)>0: avg_hours=float(wh.mean())
+        sick_dates=[]
+        for _,r in selected_df.iterrows():
+            s=str(r.get("סטטוס/הערות","") or "").strip()
+            if is_sick(s) and not is_no_att(s):
+                try: sick_dates.append(parse_date(str(r["תאריך"])))
+                except: pass
+        if not sick_dates:
+            df["pay_sick"]=0.0; return df
+        sick_dates=sorted(set(sick_dates))
+        pay_map={}; i=0
+        while i<len(sick_dates):
+            j=i+1
+            while j<len(sick_dates) and (sick_dates[j]-sick_dates[j-1]).days==1: j+=1
+            seq=sick_dates[i:j]
+            for k,d in enumerate(seq, start=1):
+                pct=0.0 if k==1 else (0.5 if k in (2,3) else 1.0)
+                pay_map[d]=avg_hours*HOURLY_WAGE*pct
+            i=j
+        df["pay_sick"]=0.0
+        for d,pay in pay_map.items():
+            if d in df["תאריך"].values:
+                df.loc[df["תאריך"]==d,[
+                    "pay_base","pay_evening_bonus","pay_night_bonus","pay_weekend_bonus","pay_holiday_bonus",
+                    "pay_overtime_t1","pay_overtime_t2","travel_pay","pay_total_day","weekly_topup_125","weekly_topup_150"
+                ]]=0.0
+                df.loc[df["תאריך"]==d,"pay_sick"]=pay
+            else:
+                df=pd.concat([df,pd.DataFrame([{
+                    "תאריך":d,"סטטוס/הערות":"מחלה","is_sick":True,"holiday":False,"start":None,"end":None,
+                    "minutes_total":0,"minutes_evening":0,"minutes_night":0,"minutes_weekend":0,"minutes_holiday":0,
+                    "worked_day":False,
+                    "hours_total":0.0,"hours_evening":0.0,"hours_night":0.0,"hours_weekend":0.0,"hours_holiday":0.0,
+                    "hours_morning":0.0,
+                    "hours_ot_t1":0.0,"hours_ot_t2":0.0,
+                    "pay_base":0.0,"pay_evening_bonus":0.0,"pay_night_bonus":0.0,"pay_weekend_bonus":0.0,"pay_holiday_bonus":0.0,
+                    "pay_overtime_t1":0.0,"pay_overtime_t2":0.0,"weekly_topup_125":0.0,"weekly_topup_150":0.0,
+                    "travel_pay":0.0,"pay_total_day":0.0,"pay_sick":pay
+                }])], ignore_index=True)
+        return df.sort_values("תאריך").reset_index(drop=True)
+
+    def summarize_hours(df_paid: pd.DataFrame):
+        hours_cols=["hours_total","hours_morning","hours_evening","hours_night","hours_weekend","hours_holiday","hours_ot_t1","hours_ot_t2"]
+        for c in hours_cols:
+            if c not in df_paid.columns: df_paid[c]=0.0
+        return df_paid[hours_cols].sum()
+
+    # taxes
+    def income_tax_before_credit(monthly_taxable: float)->float:
+        tax=0.0; last=0.0
+        for cap,rate in TAX_BRACKETS:
+            if monthly_taxable>cap: tax+=(cap-last)*rate; last=cap
+            else:
+                tax+=(monthly_taxable-last)*rate
+                return max(0.0,round(tax,2))
+        return max(0.0,round(tax,2))
+    def apply_credit_points(tax_before: float)->float:
+        return max(0.0, round(tax_before - CREDIT_POINTS*CREDIT_POINT_VALUE, 2))
+    def ni_health(monthly_gross: float):
+        low=min(monthly_gross,NI_THRESHOLD); high=max(0.0,monthly_gross-NI_THRESHOLD)
+        ni=low*NI_LOW + high*NI_HIGH; health=low*HEALTH_LOW + high*HEALTH_HIGH
+        return round(ni,2), round(health,2)
+
+    def process(csv_df: pd.DataFrame):
+        selected=load_attendance_from_csv(csv_df)
+        daily=compute_daily_rows(selected)
+        paid=add_pay_columns(daily)
+
+        if OT_BASIS in ("Weekly 42h only", "Daily + Weekly (max)"):
+            paid_week = compute_weekly_overtime_topup(paid, weekly_threshold=42.0, week_start_str=WEEK_START)
+            paid_week["pay_weekly_topup"] = paid_week["weekly_topup_125"] + paid_week["weekly_topup_150"]
+        else:
+            paid_week = paid.copy()
+            paid_week["pay_weekly_topup"] = 0.0
+
+        paid_week = add_sick_pay(paid_week, selected)
+
+        if OT_BASIS == "Weekly 42h only":
+            for c in ("pay_overtime_t1","pay_overtime_t2"):
+                if c in paid_week.columns: paid_week[c]=0.0
+            paid_week["pay_total_day"] = (
+                paid_week["pay_base"] + paid_week["pay_evening_bonus"] + paid_week["pay_night_bonus"] +
+                paid_week["pay_weekend_bonus"] + paid_week["pay_holiday_bonus"] +
+                paid_week["travel_pay"] + paid_week["pay_weekly_topup"]
+            )
+            paid_final = paid_week
+        elif OT_BASIS == "Daily + Weekly (max)":
+            modelA = paid.copy(); modelA["pay_weekly_topup"]=0.0
+            modelA = add_sick_pay(modelA, selected)
+            modelA["pay_total_day_final"] = modelA["pay_total_day"]
+
+            modelB = paid_week.copy()
+            modelB_no_daily = paid.copy()
+            for c in ("pay_overtime_t1","pay_overtime_t2"):
+                if c in modelB_no_daily.columns: modelB_no_daily[c]=0.0
+            modelB["pay_total_day_final"] = (
+                modelB_no_daily["pay_base"] + modelB_no_daily["pay_evening_bonus"] + modelB_no_daily["pay_night_bonus"] +
+                modelB_no_daily["pay_weekend_bonus"] + modelB_no_daily["pay_holiday_bonus"] +
+                modelB_no_daily["travel_pay"] + modelB["pay_weekly_topup"]
+            )
+
+            paid_final = modelA.copy()
+            choose = modelB["pay_total_day_final"] > modelA["pay_total_day_final"]
+            paid_final["pay_total_day"] = modelA["pay_total_day_final"]
+            paid_final.loc[choose,"pay_total_day"] = modelB.loc[choose,"pay_total_day_final"]
+            paid_final["pay_weekly_topup"]=0.0
+        else:
+            paid_final = paid_week.copy()
+            paid_final["pay_weekly_topup"]=0.0
+
+        sums_hours = summarize_hours(paid_final)
+        wage_components = (
+            paid_final["pay_base"].sum()
+            + paid_final["pay_evening_bonus"].sum()
+            + paid_final["pay_night_bonus"].sum()
+            + paid_final["pay_weekend_bonus"].sum()
+            + paid_final["pay_holiday_bonus"].sum()
+            + paid_final.get("pay_overtime_t1",0).sum()
+            + paid_final.get("pay_overtime_t2",0).sum()
+            + paid_final.get("pay_weekly_topup",0).sum()
+            + paid_final["pay_sick"].sum()
+        )
+        travel_sum = paid_final["travel_pay"].sum()
+        monthly_gross_taxable = wage_components + travel_sum + SIBUS_MONTHLY
+
+        pension_base = monthly_gross_taxable if PENSION_BASE_MODE=="include_all" else wage_components
+        employee_pension = round(pension_base*EMPLOYEE_PENSION_RATE,2)
+        ni,health = ni_health(monthly_gross_taxable)
+        tax_before = income_tax_before_credit(monthly_gross_taxable)
+        tax_after  = apply_credit_points(tax_before)
+        net = monthly_gross_taxable - (employee_pension + ni + health + tax_after)
+
+        brk = pd.DataFrame([
+            ["שכר בסיס", paid_final["pay_base"].sum()],
+            ["תוספת ערב", paid_final["pay_evening_bonus"].sum()],
+            ["תוספת לילה", paid_final["pay_night_bonus"].sum()],
+            ["תוספת סופ\"ש", paid_final["pay_weekend_bonus"].sum()],
+            ["תוספת חג", paid_final["pay_holiday_bonus"].sum()],
+            ["שעות נוספות 125%", paid_final.get("pay_overtime_t1",0).sum()],
+            ["שעות נוספות 150%", paid_final.get("pay_overtime_t2",0).sum()],
+            ["טופ-אפ שבועי 42ש׳", paid_final.get("pay_weekly_topup",0).sum()],
+            ["מחלה", paid_final["pay_sick"].sum()],
+            ["נסיעות", travel_sum],
+            ["סיבוס", SIBUS_MONTHLY],
+            ["סה\"כ ברוטו חייב", monthly_gross_taxable],
+        ], columns=["רכיב", "סכום"]).style.format({"סכום": money})
+
+        deds = pd.DataFrame([
+            ["פנסיה עובד", employee_pension],
+            ["ביטוח לאומי", ni],
+            ["בריאות", health],
+            ["מס הכנסה לפני זיכוי", tax_before],
+            [f"זיכוי מס (נק׳ × {CREDIT_POINT_VALUE:.0f})", tax_before - tax_after],
+            ["מס הכנסה לתשלום", tax_after],
+        ], columns=["ניכוי", "סכום"]).style.format({"סכום": money})
+
+        charts_df = pd.DataFrame({
+            "רכיב": ["שכר בסיס","ערב","לילה","סופ\"ש","חג","OT 125%","OT 150%","טופ-אפ שבועי","מחלה","נסיעות","סיבוס"],
+            "סכום": [
+                paid_final["pay_base"].sum(),
+                paid_final["pay_evening_bonus"].sum(),
+                paid_final["pay_night_bonus"].sum(),
+                paid_final["pay_weekend_bonus"].sum(),
+                paid_final["pay_holiday_bonus"].sum(),
+                paid_final.get("pay_overtime_t1",0).sum(),
+                paid_final.get("pay_overtime_t2",0).sum(),
+                paid_final.get("pay_weekly_topup",0).sum(),
+                paid_final["pay_sick"].sum(),
+                travel_sum,
+                SIBUS_MONTHLY,
+            ]
+        })
+
+        # exports
+        csv_buf=io.StringIO(); paid_final.to_csv(csv_buf,index=False,encoding="utf-8-sig"); csv_bytes=csv_buf.getvalue().encode("utf-8-sig")
+        json_bytes=json.dumps({
+            "gross": monthly_gross_taxable,
+            "net": float(net),
+            "deductions_total": float((employee_pension + ni + health + tax_after))
+        }, ensure_ascii=False, indent=2).encode("utf-8")
+
+        # sick days counters
+        sick_df = paid_final.copy()
+        if "is_sick" not in sick_df.columns:
+            sick_df["is_sick"] = False
+        if "pay_sick" not in sick_df.columns:
+            sick_df["pay_sick"] = 0.0
+        total_sick_days  = int((sick_df["is_sick"] == True).sum())
+        paid_sick_days   = int(((sick_df["is_sick"] == True) & (sick_df["pay_sick"] > 0)).sum())
+        unpaid_sick_days = total_sick_days - paid_sick_days
+
+        return (
+            paid_final, summarize_hours(paid_final), brk, deds, charts_df, net, monthly_gross_taxable,
+            csv_bytes, json_bytes, total_sick_days, paid_sick_days, unpaid_sick_days
+        )
+
+    return process
+
+# =========================
+# Sidebar – settings
+# =========================
+with st.sidebar:
+    st.markdown('<span class="badge">הגדרות</span>', unsafe_allow_html=True)
+    st.header("⚙️ בסיס")
+    hourly  = st.number_input("שכר לשעה (₪)", min_value=0.0, value=DEFAULT_PARAMS["HOURLY_WAGE"], step=0.5)
+    evening = st.number_input("תוספת ערב (%)", min_value=0.0, value=DEFAULT_PARAMS["EVENING_BONUS"]*100, step=5.0)/100.0
+    night   = st.number_input("תוספת לילה (%)", min_value=0.0, value=DEFAULT_PARAMS["NIGHT_BONUS"]*100, step=5.0)/100.0
+    weekend = st.number_input("תוספת סופ״ש (%)", min_value=0.0, value=DEFAULT_PARAMS["WEEKEND_BONUS"]*100, step=5.0)/100.0
+    holiday = st.number_input("תוספת חג (%)", min_value=0.0, value=DEFAULT_PARAMS["HOLIDAY_BONUS"]*100, step=5.0)/100.0
+    travel  = st.number_input("נסיעות ליום (₪)", min_value=0.0, value=DEFAULT_PARAMS["DAILY_TRAVEL"], step=1.0)
+    sibus   = st.number_input("סיבוס חודשי (₪)", min_value=0.0, value=DEFAULT_PARAMS["SIBUS_MONTHLY"], step=10.0)
+
+    st.subheader("⏱️ שעות נוספות")
+    ot_t1 = st.number_input("125% – תוספת (%)", min_value=0.0, value=DEFAULT_PARAMS["OVERTIME_T1_BONUS"]*100, step=5.0)/100.0
+    ot_t2 = st.number_input("150% – תוספת (%)", min_value=0.0, value=DEFAULT_PARAMS["OVERTIME_T2_BONUS"]*100, step=5.0)/100.0
+    base_hours = st.number_input("שעות רגילות ביום", min_value=0.0, value=DEFAULT_PARAMS["DAILY_REGULAR_HOURS"], step=0.5)
+    t1_hours   = st.number_input("שעות בדרגת 125% (ביום)", min_value=0.0, value=DEFAULT_PARAMS["DAILY_T1_HOURS"], step=0.5)
+
+    st.radio("בסיס שעות נוספות", ["Daily only", "Weekly 42h only", "Daily + Weekly (max)"], index=2, key="ot_basis")
+    st.selectbox("תחילת שבוע", ["Sunday","Monday"], index=0, key="week_start")
+
+    st.subheader("🏦 מסים ופנסיה")
+    pension_rate = st.number_input("פנסיה עובד (%)", min_value=0.0, value=DEFAULT_PARAMS["EMPLOYEE_PENSION_RATE"]*100, step=0.5)/100.0
+    pension_base_mode = st.radio("בסיס לפנסיה", ["wage_only","include_all"], index=0, horizontal=True)
+
+    credit_pts = st.number_input("נק׳ זיכוי", min_value=0.0, value=DEFAULT_PARAMS["CREDIT_POINTS"], step=0.25)
+    credit_val = st.number_input("שווי נק׳ (₪)", min_value=0.0, value=DEFAULT_PARAMS["CREDIT_POINT_VALUE"], step=5.0)
+    default_brackets = [{"cap": 6790, "rate": 0.10},{"cap": 9720,"rate":0.14},{"cap":15760,"rate":0.20},
+                        {"cap":21700,"rate":0.31},{"cap":45180,"rate":0.35},{"cap": None,"rate":0.47}]
+    tax_json = st.text_area("מדרגות מס (JSON)", value=json.dumps(default_brackets, ensure_ascii=False, indent=2), height=160)
+
+    c6,c7 = st.columns(2)
+    with c6:
+        ni_thr = st.number_input("סף ב״ל/בריאות (₪)", min_value=0.0, value=DEFAULT_PARAMS["NI_THRESHOLD"], step=50.0)
+        ni_low = st.number_input("ব״ל – מדרגה נמוכה (%)", min_value=0.0, value=DEFAULT_PARAMS["NI_LOW"]*100, step=0.1)/100.0
+        hl_low = st.number_input("בריאות – מדרגה נמוכה (%)", min_value=0.0, value=DEFAULT_PARAMS["HEALTH_LOW"]*100, step=0.1)/100.0
+    with c7:
+        ni_high= st.number_input("ב״ל – מדרגה גבוהה (%)", min_value=0.0, value=DEFAULT_PARAMS["NI_HIGH"]*100, step=0.5)/100.0
+        hl_high= st.number_input("בריאות – מדרגה גבוהה (%)", min_value=0.0, value=DEFAULT_PARAMS["HEALTH_HIGH"]*100, step=0.5)/100.0
+
+# parse tax brackets
+def parse_tax_brackets(txt: str):
+    try:
+        arr=json.loads(txt)
+        out=[]
+        for item in arr:
+            cap=item["cap"]; rate=float(item["rate"])
+            out.append((float("inf") if cap in (None,"null") else float(cap), rate))
+        return out
+    except Exception:
+        return DEFAULT_PARAMS["TAX_BRACKETS"]
+
+# =========================
+# Params dict
+# =========================
+params = {
+    "HOURLY_WAGE": hourly, "EVENING_BONUS": evening, "NIGHT_BONUS": night,
+    "WEEKEND_BONUS": weekend, "HOLIDAY_BONUS": holiday,
+    "DAILY_TRAVEL": travel, "SIBUS_MONTHLY": sibus,
+    "OVERTIME_T1_BONUS": ot_t1, "OVERTIME_T2_BONUS": ot_t2,
+    "DAILY_REGULAR_HOURS": base_hours, "DAILY_T1_HOURS": t1_hours,
+    "EMPLOYEE_PENSION_RATE": pension_rate, "PENSION_BASE_MODE": pension_base_mode,
+    "OT_BASIS": st.session_state.ot_basis, "WEEK_START": st.session_state.week_start,
+    "CREDIT_POINTS": credit_pts, "CREDIT_POINT_VALUE": credit_val,
+    "TAX_BRACKETS": parse_tax_brackets(tax_json),
+    "NI_THRESHOLD": ni_thr, "NI_LOW": ni_low, "NI_HIGH": ni_high,
+    "HEALTH_LOW": hl_low, "HEALTH_HIGH": hl_high,
+    "USE_AVG_HOURS_FOR_SICK": DEFAULT_PARAMS["USE_AVG_HOURS_FOR_SICK"],
+    "DEFAULT_DAILY_SICK_HOURS": DEFAULT_PARAMS["DEFAULT_DAILY_SICK_HOURS"],
+    "SICK_KEYWORD": DEFAULT_PARAMS["SICK_KEYWORD"],
+    "NO_ATTENDANCE_KEYWORD": DEFAULT_PARAMS["NO_ATTENDANCE_KEYWORD"],
+    "HOLIDAY_HINTS": DEFAULT_PARAMS["HOLIDAY_HINTS"],
+}
+
+# =========================
+# FLOW state
+# =========================
+if "step" not in st.session_state: st.session_state.step = 1
+if "input_df_raw" not in st.session_state: st.session_state.input_df_raw = None
+if "input_df_edited" not in st.session_state: st.session_state.input_df_edited = None
+
+st.title("💸 מחשבון שכר – אשף זרימה")
+def step_header(num, title):
+    st.markdown(f'<div class="step"><div class="num">{num}</div><div class="title">{title}</div></div>', unsafe_allow_html=True)
+
+processor = build_processor(params)
+
+# =========================
+# Step 1: Upload
+# =========================
+if st.session_state.step == 1:
+    step_header(1, "העלה קובץ (CSV או PDF)")
+    mode = st.radio("בחר מקור:", ["CSV", "PDF"], horizontal=True)
+    df_in = None
+
+    if mode=="CSV":
+        st.caption("דרוש CSV עם העמודות: סה\"כ נוכחות, שעת יציאה, שעת כניסה, סטטוס/הערות, יום בשבוע, תאריך")
+        up = st.file_uploader("בחר קובץ CSV", type=["csv"], key="u_csv")
+        if up is not None:
+            try: df_in = pd.read_csv(up, encoding="utf-8-sig")
+            except UnicodeDecodeError: df_in = pd.read_csv(up)
+    else:
+        st.caption("PDF של דוח נוכחות. נחלץ טבלה ותתבצע התאמת עברית חכמה.")
+        heb_fix_mode = st.selectbox("מצב תיקון עברית מה-PDF", ["אוטומטי","לא להפוך","להפוך תמיד"], index=0)
+        up = st.file_uploader("בחר קובץ PDF", type=["pdf"], key="u_pdf")
+        if up is not None:
+            try:
+                import pdfplumber
+                with pdfplumber.open(up) as pdf:
+                    tables=[]
+                    for page in pdf.pages:
+                        for t in (page.extract_tables() or []):
+                            df=pd.DataFrame(t)
+                            if df.shape[1]>=6 and df.dropna(how="all").shape[0]>0:
+                                tables.append(df)
+                if not tables:
+                    st.error("לא נמצאו טבלאות מתאימות ב־PDF")
+                else:
+                    df=tables[0].reset_index(drop=True).copy()
+                    cols_map = {2:"סה\"כ נוכחות", 3:"שעת יציאה", 4:"שעת כניסה", 5:"סטטוס/הערות", 7:"יום בשבוע", 8:"תאריך"}
+                    df_in = df.rename(columns=cols_map)
+                    need = ["סה\"כ נוכחות","שעת יציאה","שעת כניסה","סטטוס/הערות","יום בשבוע","תאריך"]
+                    df_in = df_in[[c for c in need if c in df_in.columns]].copy()
+                    # תיקון תאריך/יום חסרים משורה שנייה של אותו יום
+                    for col in ["תאריך", "יום בשבוע"]:
+                        if col in df_in.columns:
+                            df_in[col] = df_in[col].astype(str).str.strip()
+                            df_in[col] = df_in[col].replace(
+                                {"None": pd.NA, "nan": pd.NA, "NaN": pd.NA, "": pd.NA, ".": pd.NA})
+                    df_in[["תאריך", "יום בשבוע"]] = df_in[["תאריך", "יום בשבוע"]].ffill()
+
+                    mode_map = {"אוטומטי":"auto","לא להפוך":"off","להפוך תמיד":"on"}
+                    df_in = apply_hebrew_correction(df_in, mode=mode_map[heb_fix_mode])
+                    st.success("טבלה חולצה. ממשיכים לעריכה…")
+            except ModuleNotFoundError:
+                st.error("נדרש: pip install pdfplumber")
+            except Exception as e:
+                st.error(f"שגיאת חילוץ PDF: {e}")
+
+    if df_in is not None:
+        st.session_state.input_df_raw = df_in
+        st.session_state.input_df_edited = df_in.copy()  # נשמור גם כבסיס לעריכה
+        st.session_state.step = 2
+        st.rerun()
+
+# =========================
+# Step 2: Edit & confirm
+# =========================
+elif st.session_state.step == 2:
+    step_header(2, "ערוך את הטבלה ואשר")
+
+    if st.session_state.input_df_raw is None:
+        st.warning("אין נתונים לתצוגה. חזור לשלב 1.")
+        if st.button("⬅️ חזור להעלאת קובץ"):
+            st.session_state.step = 1
+            st.rerun()
+    else:
+        st.caption("ודא כותרות: סה\"כ נוכחות, שעת יציאה, שעת כניסה, סטטוס/הערות, יום בשבוע, תאריך. ניתן להוסיף/למחוק/לערוך.")
+
+        # ======= טופס עריכה — לא מבצע rerun על כל שינוי =======
+        with st.form("edit_form", clear_on_submit=False):
+            edited = st.data_editor(
+                st.session_state.input_df_raw,
+                use_container_width=True,
+                num_rows="dynamic",
+                hide_index=True,
+                key="editor_table",
+            )
+
+            # ולידציה לפני כפתורי הפעולה
+            cols_needed = ["סה\"כ נוכחות","שעת יציאה","שעת כניסה","סטטוס/הערות","יום בשבוע","תאריך"]
+            missing = [c for c in cols_needed if c not in edited.columns]
+            if missing:
+                st.error("חסרות העמודות: " + ", ".join(missing))
+
+            colA, colB = st.columns(2)
+            back_btn   = colA.form_submit_button("⬅️ חזור")
+            next_btn   = colB.form_submit_button("✅ אשר והמשך", disabled=bool(missing), type="primary")
+        # ======= סוף טופס =======
+
+        # חשוב: שמירה מפורשת רק לאחר לחיצה
+        if back_btn:
+            st.session_state.input_df_raw    = edited.copy()   # נשמרת העריכה
+            st.session_state.input_df_edited = edited.copy()
+            st.session_state.step = 1
+            st.rerun()
+
+        if next_btn:
+            st.session_state.input_df_raw    = edited.copy()   # נשמרת העריכה
+            st.session_state.input_df_edited = edited.copy()
+            st.session_state.step = 3
+            st.rerun()
+
+
+# =========================
+# Step 3: Results
+# =========================
+elif st.session_state.step == 3:
+    step_header(3, "תוצאות וחישוב")
+    if st.session_state.input_df_edited is None:
+        st.warning("אין טבלה מאושרת. חזור לשלב העריכה.")
+        if st.button("⬅️ חזור לעריכה"):
+            st.session_state.step = 2
+            st.rerun()
+    else:
+        try:
+            (paid_df, sums_hours, brk_style, deds_style, charts_df, net, gross,
+             csv_bytes, json_bytes, sick_all, sick_paid, sick_unpaid) = build_processor(params)(st.session_state.input_df_edited)
+
+            # KPIs
+            k1,k2,k3 = st.columns(3)
+            with k1:
+                st.markdown('<div class="kpi">', unsafe_allow_html=True)
+                st.markdown('<div class="label">סה״כ ברוטו חייב</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="value">{money(gross)}</div>', unsafe_allow_html=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+            with k2:
+                st.markdown('<div class="kpi">', unsafe_allow_html=True)
+                st.markdown('<div class="label">סה״כ ניכויים</div>', unsafe_allow_html=True)
+                deductions_total = gross - net
+                st.markdown(f'<div class="value" style="color:{ACCENT}">{money(deductions_total)}</div>', unsafe_allow_html=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+            with k3:
+                st.markdown('<div class="kpi">', unsafe_allow_html=True)
+                st.markdown('<div class="label">נטו לתשלום</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="value" style="color:{PRIMARY}">{money(net)}</div>', unsafe_allow_html=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown("#### פירוט רכיבי ברוטו")
+            st.dataframe(brk_style, use_container_width=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            cA, cB = st.columns([1.2, 1])
+            with cA:
+                st.markdown('<div class="card">', unsafe_allow_html=True)
+                st.markdown("#### רכיבי שכר (גרף עמודות)")
+                chart_df = charts_df.sort_values("סכום", ascending=False).head(8).set_index("רכיב")
+                st.bar_chart(chart_df)
+                st.markdown('</div>', unsafe_allow_html=True)
+            with cB:
+                st.markdown('<div class="card">', unsafe_allow_html=True)
+                st.markdown("#### ניכויים")
+                st.dataframe(deds_style, use_container_width=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+
+            # שעות + מחלה
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown("#### סיכום שעות")
+            colH, colS = st.columns([1.2, 0.8])
+            with colH:
+                hours_df = pd.DataFrame([
+                    ["סה\"כ שעות",  sums_hours.get("hours_total",  0.0)],
+                    ["בוקר",        sums_hours.get("hours_morning",0.0)],
+                    ["ערב",         sums_hours.get("hours_evening",0.0)],
+                    ["לילה",        sums_hours.get("hours_night",  0.0)],
+                    ["סופ\"ש",      sums_hours.get("hours_weekend",0.0)],
+                    ["חג",          sums_hours.get("hours_holiday",0.0)],
+                    ["נוספות 125%", sums_hours.get("hours_ot_t1",  0.0)],
+                    ["נוספות 150%", sums_hours.get("hours_ot_t2",  0.0)],
+                ], columns=["קטגוריה","שעות"])
+                st.dataframe(hours_df.style.format({"שעות":"{:.2f}"}), use_container_width=True, hide_index=True)
+            with colS:
+                sick_tbl = pd.DataFrame([
+                    ["סה\"כ ימי מחלה",      sick_all],
+                    ["ימי מחלה בתשלום",     sick_paid],
+                    ["ימי מחלה ללא תשלום",  sick_unpaid],
+                ], columns=["קטגוריה", "כמות"])
+                st.dataframe(sick_tbl, use_container_width=True, hide_index=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown("#### פירוט יומי (לאחר החישוב)")
+            st.dataframe(paid_df, use_container_width=True, hide_index=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            c1,c2,c3 = st.columns(3)
+            with c1:
+                st.download_button("⬇️ פירוט יומי (CSV)", data=csv_bytes, file_name="daily_breakdown.csv", mime="text/csv", type="primary")
+            with c2:
+                st.download_button("⬇️ KPIs (JSON)", data=json_bytes, file_name="summary_kpis.json", mime="application/json")
+            with c3:
+                if st.button("⬅️ חזור לעריכה", use_container_width=True):
+                    # נשמור את הטבלה שאושרה/נערכה קודם
+                    st.session_state.input_df_raw = st.session_state.input_df_edited.copy()
+                    st.session_state.step = 2
+                    st.rerun()
+
+        except ValueError as ve:
+            st.error(f"שגיאת ולידציה: {ve}")
+        except Exception as e:
+            st.error(f"שגיאת עיבוד: {e}")

@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <title>מחשבון שכר אוטומטי | PDF מל״ם</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- PDF.js (UMD, ללא type=module) מ-jsDelivr -->
+  <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@4.8.69/build/pdf.min.js"></script>
+  <script>
+    // ודא שהספרייה קיימת ואל תדרוס אותה אם כבר נטענה
+    window.pdfjsLib = window.pdfjsLib || window["pdfjs-dist/build/pdf"];
+    if (!window.pdfjsLib) {
+      console.error("PDF.js failed to load — pdfjsLib is undefined");
+    } else {
+      // חובה להגדיר workerSrc כדי למנוע שגיאות
+      pdfjsLib.GlobalWorkerOptions.workerSrc =
+        "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.8.69/build/pdf.worker.min.js";
+
+      // בדיקת sanity
+      console.log("pdfjsLib ready:", typeof pdfjsLib, typeof pdfjsLib.getDocument);
+    }
+  </script>
+
+  <!-- PapaParse לקריאת CSV -->
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+
+  <style>
+    :root { --bg: #0b1220; --card:#111827; --muted:#9ca3af; --fg:#e5e7eb; --acc:#22d3ee; }
+    html,body { margin:0; padding:0; font-family:system-ui, "Segoe UI", Arial; background:var(--bg); color:var(--fg); }
+    .wrap { max-width:1100px; margin:0 auto; padding:24px; }
+    h1 { font-size:1.6rem; margin:0 0 10px; }
+    .sub { color:var(--muted); margin-bottom:16px; }
+    .card { background:var(--card); border:1px solid #1f2937; border-radius:14px; padding:16px; box-shadow:0 10px 30px rgba(0,0,0,.25); margin-bottom:16px; }
+    .grid { display:grid; gap:12px; }
+    .g-2 { grid-template-columns:repeat(2,1fr); } .g-3 { grid-template-columns:repeat(3,1fr); } .g-4{ grid-template-columns:repeat(4,1fr); }
+    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    label { font-size:.9rem; color:var(--muted); margin-bottom:6px; display:block; }
+    input[type="number"], input[type="text"], select  {
+      width:100%; background:#0f172a; color:var(--fg); border:1px solid #374151; border-radius:10px; padding:10px 12px; outline:none;
+    }
+    input[type="file"] { width:100%; color:var(--fg); }
+    .btn { background:linear-gradient(135deg,var(--acc),#3b82f6); color:#001; font-weight:700; border:none; padding:10px 14px; border-radius:12px; cursor:pointer; }
+    .btn.secondary { background:#222; color:#fff; border:1px solid #374151; }
+    .muted { color:var(--muted); font-size:.9rem; }
+    table { width:100%; border-collapse:collapse; margin-top:10px; font-size:.9rem; }
+    th, td { border-bottom:1px solid #1f2937; padding:8px; text-align:right; }
+    th { color:#a5b4fc; font-weight:600; background:#0f172a; position:sticky; top:0; }
+    .metrics { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; }
+    .metric { background:#0f172a; border:1px solid #1f2937; border-radius:12px; padding:12px; }
+    .metric .k { font-size:.85rem; color:var(--muted); }
+    .metric .v { font-size:1.2rem; font-weight:700; margin-top:6px; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:.8rem; background:#0f172a; border:1px solid #334155; color:#c7d2fe;}
+    @media (max-width:900px){ .g-4,.g-3,.g-2{ grid-template-columns:1fr; } .metrics{ grid-template-columns:1fr 1fr; } }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>💸 מחשבון שכר אוטומטי לדו״ח נוכחות (מל״ם)</h1>
+  <div class="sub">העלה PDF או CSV עוקף, קבע פרמטרים, וקבל פירוט יומי + סיכום והורדת CSV.</div>
+
+  <div class="card">
+    <div class="grid g-4">
+      <div>
+        <label>שכר לשעה (₪)</label>
+        <input id="hourlyRate" type="number" step="0.5" value="65" />
+      </div>
+      <div>
+        <label>דמי נסיעות ליום (₪)</label>
+        <input id="travelPerDay" type="number" step="0.1" value="22.6" />
+      </div>
+      <div>
+        <label>חישוב מחלה</label>
+        <select id="sickMode">
+          <option value="avg" selected>ממוצע שעות יומיות בפועל</option>
+          <option value="fixed">ערך קבוע</option>
+        </select>
+      </div>
+      <div>
+        <label>שעות ליום מחלה (אם קבוע)</label>
+        <input id="fixedSickHours" type="number" step="0.25" value="8.5" />
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:12px;">
+      <label style="display:flex;align-items:center;gap:8px;">
+        <input id="enableWeekendHoliday" type="checkbox" checked />
+        חשב שבת/חג בתוספת 50% (כולל שישי מ־16:00, שבת, וראשון עד 07:30; ערב חג מ־16:00)
+      </label>
+    </div>
+
+    <div class="grid g-2" style="margin-top:12px;">
+      <div>
+        <label>תאריכי חג (DD/MM/YYYY, מופרד בפסיקים)</label>
+        <input id="manualHolidays" type="text" placeholder="03/10/2025, 04/10/2025" />
+      </div>
+      <div>
+        <label>תאריכי ערב חג (DD/MM/YYYY, מופרד בפסיקים)</label>
+        <input id="manualErevHolidays" type="text" placeholder="02/10/2025" />
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="grid g-3">
+      <div>
+        <label>דו״ח PDF ממלם</label>
+        <input id="pdfInput" type="file" accept="application/pdf" />
+      </div>
+      <div>
+        <label>CSV תצוגה מקדימה (עוקף סטטוסים/שעות)</label>
+        <input id="csvPreviewInput" type="file" accept=".csv" />
+        <div class="muted">עמודות: תאריך, יום, סטטוס, כניסה, יציאה</div>
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <button id="analyzeBtn" class="btn">חשב ➜</button>
+      </div>
+    </div>
+    <div class="muted" style="margin-top:10px;">טיפ: אם ה־PDF “רועש”, העלה CSV כדי לעקוף ולדייק.</div>
+  </div>
+
+  <div id="previewCard" class="card" style="display:none;">
+    <div class="row" style="justify-content:space-between;align-items:center;">
+      <h3 style="margin:0;">תצוגה מקדימה של הימים שזוהו</h3>
+      <span class="pill" id="previewCount"></span>
+    </div>
+    <div id="previewTable"></div>
+  </div>
+
+  <div id="resultsCard" class="card" style="display:none;">
+    <h3 style="margin-top:0;">🔢 תוצאות</h3>
+    <div class="metrics" style="margin-bottom:12px;">
+      <div class="metric"><div class="k">ימי עבודה</div><div class="v" id="mWorkdays">-</div></div>
+      <div class="metric"><div class="k">ימי מחלה</div><div class="v" id="mSickdays">-</div></div>
+      <div class="metric"><div class="k">שעות/יום למחלה</div><div class="v" id="mSickHours">-</div></div>
+      <div class="metric"><div class="k">ברוטו משוער (₪)</div><div class="v" id="mGross">-</div></div>
+    </div>
+
+    <h4>פירוט יומי</h4>
+    <div id="dailyTable"></div>
+
+    <div class="row" style="gap:8px;margin-top:8px;">
+      <button id="dlDaily" class="btn secondary">⬇️ הורד CSV: פירוט יומי</button>
+      <button id="dlSummary" class="btn secondary">⬇️ הורד CSV: סיכום שעות</button>
+    </div>
+
+    <h4 style="margin-top:20px;">סיכום שעות ותוספות</h4>
+    <div id="summaryTable"></div>
+  </div>
+</div>
+
+<script>
+  // ---------- עזר ----------
+  const HE_DAYS = ["ראשון","שני","שלישי","רביעי","חמישי","שישי","שבת"];
+  const DATE_RE = /(\d{2}\/\d{2}\/\d{4})/g;
+  const TIME_RE = /\b(\d{2}:\d{2})\b/g;
+  const qs = id => document.getElementById(id);
+  const fmtNum = n => (n ?? 0).toLocaleString('he-IL');
+  const parseDate = s => {
+    const [d,m,y] = s.trim().split("/").map(Number);
+    return new Date(y, m-1, d, 0,0,0,0);
+  };
+  const sameYMD = (a,b) => a.getFullYear()===b.getFullYear() && a.getMonth()===b.getMonth() && a.getDate()===b.getDate();
+
+  const parseTime = s => {
+    const [hh, mm] = s.split(":").map(Number);
+    if (isNaN(hh) || isNaN(mm)) return null;
+    return {h:hh, m:mm};
+  };
+  const timeStr = t => `${String(t.h).padStart(2,'0')}:${String(t.m).padStart(2,'0')}`;
+  const tToDate = (d, t) => new Date(d.getFullYear(), d.getMonth(), d.getDate(), t.h, t.m, 0, 0);
+  const addMin = (dt, m) => new Date(dt.getTime() + m*60000);
+
+  function parseDatesList(s){
+    if(!s || !s.trim()) return new Set();
+    const arr = s.split(",").map(x=>x.trim()).filter(Boolean);
+    const set = new Set();
+    for(const d of arr){ set.add(parseDate(d)); }
+    return set;
+  }
+  function dateInSet(date, set){
+    for(const d of set){ if (sameYMD(d,date)) return true; }
+    return false;
+  }
+
+  // הסרת placeholders של 00:00 ו-23:59
+  function cleanTimesForDay(arr){
+    const out = [];
+    for(const s of arr){
+      if (s==="00:00" || s==="23:59") continue;
+      const t = parseTime(s);
+      if (t) out.push(t);
+    }
+    return out;
+  }
+
+  // ---------- קריאת PDF ----------
+  async function extractTextFromPdf(file){
+    if (!window.pdfjsLib) throw new Error("pdfjsLib לא נטען");
+    const buf = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({data: buf}).promise;
+    let text = "";
+    for (let i=1;i<=pdf.numPages;i++){
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      const pageText = content.items.map(it=>it.str).join(" ");
+      text += "\n" + pageText;
+    }
+    return text;
+  }
+
+  // ---------- חילוץ מדויק של "שעת כניסה"/"שעת יציאה" ----------
+  function extractInOutFromBlock(block){
+    // 1) קודם חפש "שעת כניסה"/"שעת יציאה"
+    const reIn1  = /ש(?:עת)?\s*כניסה[^\d]{0,8}(\d{2}:\d{2})/g;
+    const reOut1 = /ש(?:עת)?\s*יציאה[^\d]{0,8}(\d{2}:\d{2})/g;
+    const ins1  = [...block.matchAll(reIn1)].map(m=>m[1]);
+    const outs1 = [...block.matchAll(reOut1)].map(m=>m[1]);
+
+    // 2) אם לא נמצא, חפש "כניסה ... HH:MM"/"יציאה ... HH:MM"
+    const reIn2  = /כניסה[^\d]{0,8}(\d{2}:\d{2})/g;
+    const reOut2 = /יציאה[^\d]{0,8}(\d{2}:\d{2})/g;
+    const ins2  = ins1.length ? [] : [...block.matchAll(reIn2)].map(m=>m[1]);
+    const outs2 = outs1.length ? [] : [...block.matchAll(reOut2)].map(m=>m[1]);
+
+    let ins = cleanTimesForDay([...ins1, ...ins2]);
+    let outs = cleanTimesForDay([...outs1, ...outs2]);
+
+    // 3) fallback: כל הזמנים בבלוק → min/max
+    if (!ins.length && !outs.length){
+      const all = cleanTimesForDay(block.match(TIME_RE) || []);
+      if (all.length){
+        all.sort((a,b)=> a.h!==b.h ? a.h-b.h : a.m-b.m);
+        return { first_in: all[0], last_out: all[all.length-1] };
+      }
+      return { first_in:null, last_out:null };
+    }
+
+    const byClockAsc = (a,b)=> (a.h!==b.h ? a.h-b.h : a.m-b.m);
+    if (ins.length) ins.sort(byClockAsc);
+    if (outs.length) outs.sort(byClockAsc);
+    const first_in = ins.length ? ins[0] : null;
+    const last_out = outs.length ? outs[outs.length-1] : null;
+    return { first_in, last_out };
+  }
+
+  // ---------- בניית רשומות יומיות מהטקסט ----------
+  function extractEntriesFromText(text){
+    const parts = text.split(DATE_RE); // [..., date, block, date, block, ...]
+    const entries = [];
+    for(let i=1; i<parts.length; i+=2){
+      const dateStr = parts[i];
+      const block = parts[i+1] || "";
+      const date = parseDate(dateStr);
+
+      // יום בשבוע
+      let dow_he = "";
+      for(const name of HE_DAYS){ if(block.includes(name)){ dow_he = name; break; } }
+
+      // סטטוס (קדימות למחלה)
+      let status = "";
+      if (/\bמחלה\b/.test(block)) status = "מחלה";
+      else if (/אין\s+דיווח\s+נוכחות/.test(block)) status = "אין דיווח";
+
+      // כניסה/יציאה מתוך עמודות (אם יש)
+      let { first_in, last_out } = extractInOutFromBlock(block);
+      if (status !== ""){ first_in = null; last_out = null; } // מחלה/אין-דיווח = בלי שעות
+
+      const is_hag_text = /\bחג\b/.test(block);
+      const is_erev_hag_text = /\bערב\s*חג\b/.test(block);
+
+      entries.push({ date, dow_he, status, first_in, last_out, is_hag_text, is_erev_hag_text });
+    }
+    return entries;
+  }
+
+  // ---------- Override מ-CSV ----------
+  async function applyPreviewOverride(entries, file){
+    const csv = await new Promise((resolve,reject)=>{
+      Papa.parse(file, { header:true, complete: res=>resolve(res), error: err=>reject(err), encoding:"UTF-8" });
+    });
+    const map = new Map();
+    for(const row of csv.data){
+      if(!row || !row["תאריך"]) continue;
+      map.set(parseDate(String(row["תאריך"])).getTime(), row);
+    }
+    return entries.map(e=>{
+      const row = map.get(e.date.getTime());
+      if (!row) return e;
+      const status = (row["סטטוס"]||"").trim();
+      if (status && status !== "עבודה"){
+        return { ...e, status, first_in:null, last_out:null };
+      } else {
+        const fi = (row["כניסה"]||"").trim();
+        const lo = (row["יציאה"]||"").trim();
+        return {
+          ...e,
+          first_in: fi ? parseTime(fi) : e.first_in,
+          last_out:  lo ? parseTime(lo) : e.last_out
+        };
+      }
+    });
+  }
+
+  // ---------- חלוקת שעות למשמרות ----------
+  function segmentHours(date, startT, endT, enableWeekendHoliday, holidaySet, erevHolidaySet){
+    const buckets = {regular:0, evening:0, night:0, weekend:0};
+    if (!startT || !endT) return buckets;
+
+    let start = tToDate(date, startT);
+    let end   = tToDate(date, endT);
+    if (end <= start) end = addMin(end, 24*60); // משמרת שחוצה חצות
+
+    const step = 15; // רבע שעה
+    for(let t = new Date(start); t < end; t = addMin(t, step)){
+      const dow = t.getDay(); // 0=א', 5=ו', 6=ש'
+      const hh = t.getHours(), mm = t.getMinutes();
+      const tt = hh*60 + mm;
+      const d0 = new Date(t.getFullYear(), t.getMonth(), t.getDate());
+
+      const inNight   = tt >= 0 && tt < (7*60+30);     // 00:00–07:30
+      const inEvening = tt >= (16*60) && tt < (24*60); // 16:00–24:00
+
+      let weekendish = false;
+      if (enableWeekendHoliday){
+        if ((dow===5 && tt>=16*60) || (dow===6) || (dow===0 && tt < 7*60+30)) weekendish = true; // שישי 16:00 → שבת → ראשון 07:30
+        if (dateInSet(d0, holidaySet)) weekendish = true; // חג מלא
+        if (dateInSet(d0, erevHolidaySet) && (tt >= 16*60 || tt < 7*60+30)) weekendish = true; // ערב חג
+      }
+
+      let cat = "regular";
+      if (weekendish) cat = "weekend";
+      else if (inNight) cat = "night";
+      else if (inEvening) cat = "evening";
+
+      buckets[cat] += step/60;
+    }
+    return buckets;
+  }
+
+  // ---------- חישוב שכר ----------
+  function computePay(entries, opts){
+    const { hourlyRate, travelPerDay, sickMode, fixedSickHours, enableWeekendHoliday, manualHolidays, manualErevHolidays } = opts;
+
+    const worked = [];
+    const sick = [];
+    for(const e of entries){
+      if (e.status === "מחלה") sick.push(e);
+      else if (e.status === "אין דיווח") continue;
+      else worked.push(e);
+    }
+
+    const totals = {regular:0, evening:0, night:0, weekend:0};
+    const perDay = [];
+    for(const e of worked){
+      if (!e.first_in || !e.last_out) continue;
+
+      const isHag  = e.is_hag_text || dateInSet(e.date, manualHolidays);
+      const isErev = e.is_erev_hag_text || dateInSet(e.date, manualErevHolidays);
+
+      const hagSet  = isHag ? new Set([e.date]) : new Set();
+      const erevSet = isErev ? new Set([e.date]) : new Set();
+
+      const b = segmentHours(e.date, e.first_in, e.last_out, enableWeekendHoliday, hagSet, erevSet);
+      totals.regular += b.regular; totals.evening += b.evening; totals.night += b.night; totals.weekend += b.weekend;
+
+      perDay.push({
+        תאריך: e.date, יום: e.dow_he || "", סטטוס: "עבודה",
+        כניסה: timeStr(e.first_in), יציאה: timeStr(e.last_out),
+        זוהה_חג: isHag ? "כן" : "", זוהה_ערב_חג: isErev ? "כן" : "",
+        רגיל: +b.regular.toFixed(2), ערב: +b.evening.toFixed(2), לילה: +b.night.toFixed(2), שבת_חג: +b.weekend.toFixed(2),
+        סהכ_שעות: +(b.regular + b.evening + b.night + b.weekend).toFixed(2)
+      });
+    }
+
+    const reg_h = totals.regular, eve_h = totals.evening, night_h = totals.night, we_h = totals.weekend;
+    const base_hours = reg_h + eve_h + night_h + we_h;
+
+    const base_pay = base_hours * hourlyRate;
+    const premium_pay = eve_h*hourlyRate*0.20 + night_h*hourlyRate*0.30 + we_h*hourlyRate*0.50;
+
+    const workdaysCount = new Set(perDay.map(r => r.תאריך.getTime())).size;
+    const travel_pay = workdaysCount * travelPerDay;
+
+    const sick_day_hours = (sickMode === "avg" ? (workdaysCount ? base_hours/workdaysCount : 0) : fixedSickHours);
+    let sick_hours_total = 0;
+    const sick_sorted = [...sick].sort((a,b)=> a.date - b.date);
+    sick_sorted.forEach((_, i) => {
+      const n = i+1;
+      if (n===1) sick_hours_total += 0;
+      else if (n===2 || n===3) sick_hours_total += sick_day_hours * 0.5;
+      else sick_hours_total += sick_day_hours * 1.0;
+    });
+    const sick_pay = sick_hours_total * hourlyRate;
+
+    const gross_total = base_pay + premium_pay + travel_pay + sick_pay;
+
+    const summaryRows = [
+      { קטגוריה:"רגיל", שעות:+reg_h.toFixed(2), "שכר בסיס (₪)": +(reg_h*hourlyRate).toFixed(2), "תוספת (₪)":0, "תת-סכום (₪)": +(reg_h*hourlyRate).toFixed(2) },
+      { קטגוריה:"ערב (+20%)", שעות:+eve_h.toFixed(2), "שכר בסיס (₪)": +(eve_h*hourlyRate).toFixed(2), "תוספת (₪)": +(eve_h*hourlyRate*0.20).toFixed(2), "תת-סכום (₪)": +(eve_h*hourlyRate*1.20).toFixed(2) },
+      { קטגוריה:"לילה (+30%)", שעות:+night_h.toFixed(2), "שכר בסיס (₪)": +(night_h*hourlyRate).toFixed(2), "תוספת (₪)": +(night_h*hourlyRate*0.30).toFixed(2), "תת-סכום (₪)": +(night_h*hourlyRate*1.30).toFixed(2) },
+      { קטגוריה:"שבת/חג (+50%)", שעות:+we_h.toFixed(2), "שכר בסיס (₪)": +(we_h*hourlyRate).toFixed(2), "תוספת (₪)": +(we_h*hourlyRate*0.50).toFixed(2), "תת-סכום (₪)": +(we_h*hourlyRate*1.50).toFixed(2) },
+      { קטגוריה:"סה״כ", שעות:+base_hours.toFixed(2), "שכר בסיס (₪)": +(base_hours*hourlyRate).toFixed(2), "תוספת (₪)": +(premium_pay).toFixed(2), "תת-סכום (₪)": +(base_pay+premium_pay).toFixed(2) },
+    ];
+
+    return {
+      perDay,
+      summaryRows,
+      metrics: {
+        workdays: workdaysCount,
+        sickdays: sick_sorted.length,
+        sickHoursPerDay: +sick_day_hours.toFixed(2),
+        gross: +gross_total.toFixed(2)
+      },
+      dl: {
+        dailyCsv: toCSV(perDay.map(r=>({
+          "תאריך": toHebDate(r.תאריך),
+          "יום": r.יום,
+          "סטטוס": r.סטטוס,
+          "כניסה": r.כניסה, "יציאה": r.יציאה,
+          "זוהה חג": r.זוהה_חג, "זוהה ערב חג": r.זוהה_ערב_חג,
+          "רגיל": r.רגיל, "ערב (+20%)": r.ערב, "לילה (+30%)": r.לילה, "שבת/חג (+50%)": r.שבת_חג, "סך שעות": r.סהכ_שעות
+        }))),
+        summaryCsv: toCSV(summaryRows)
+      }
+    };
+  }
+
+  // ---------- טבלאות ו-CSV ----------
+  function toHebDate(d){ return `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`; }
+  function toCSV(rows){
+    if (!rows || !rows.length) return "";
+    const headers = Object.keys(rows[0]);
+    const lines = [headers.join(",")];
+    for(const r of rows){
+      lines.push(headers.map(h=>{
+        let v = r[h];
+        if (v instanceof Date) v = toHebDate(v);
+        if (typeof v === 'string' && v.includes(",")) return `"${v.replace(/"/g,'""')}"`;
+        return v;
+      }).join(","));
+    }
+    return "\ufeff" + lines.join("\n"); // BOM ל-Excel
+  }
+  function renderTable(el, rows){
+    if (!rows || !rows.length){ el.innerHTML = '<div class="muted">אין נתונים</div>'; return; }
+    const headers = Object.keys(rows[0]);
+    let html = '<div style="overflow:auto; max-height:420px;"><table><thead><tr>';
+    for(const h of headers) html += `<th>${h}</th>`;
+    html += '</tr></thead><tbody>';
+    for(const r of rows){
+      html += '<tr>';
+      for(const h of headers){
+        let v = r[h];
+        if (v instanceof Date) v = toHebDate(v);
+        html += `<td>${v ?? ""}</td>`;
+      }
+      html += '</tr>';
+    }
+    html += '</tbody></table></div>';
+    el.innerHTML = html;
+  }
+  function downloadFile(filename, content, mime="text/csv;charset=utf-8"){
+    const blob = new Blob([content], {type:mime});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click();
+    setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 0);
+  }
+
+  // ---------- זרימה ----------
+  qs("analyzeBtn").addEventListener("click", async ()=>{
+    try{
+      const hourlyRate = parseFloat(qs("hourlyRate").value) || 0;
+      const travelPerDay = parseFloat(qs("travelPerDay").value) || 0;
+      const sickMode = qs("sickMode").value; // 'avg' | 'fixed'
+      const fixedSickHours = parseFloat(qs("fixedSickHours").value) || 0;
+      const enableWeekendHoliday = qs("enableWeekendHoliday").checked;
+      const manualHolidays = parseDatesList(qs("manualHolidays").value);
+      const manualErevHolidays = parseDatesList(qs("manualErevHolidays").value);
+
+      let entries = [];
+      const pdfFile = qs("pdfInput").files[0];
+      if (pdfFile){
+        const text = await extractTextFromPdf(pdfFile);
+        entries = extractEntriesFromText(text);
+      } else {
+        alert("אנא העלה PDF או CSV.");
+        return;
+      }
+
+      const csvPrev = qs("csvPreviewInput").files[0];
+      if (csvPrev){
+        entries = await applyPreviewOverride(entries, csvPrev);
+      }
+
+      // תצוגה מקדימה
+      qs("previewCard").style.display = "block";
+      qs("previewCount").textContent = `${entries.length} ימים`;
+      const previewRows = entries.map(e=>({
+        "תאריך": toHebDate(e.date),
+        "יום": e.dow_he || "",
+        "סטטוס": e.status || "עבודה",
+        "כניסה": e.first_in ? timeStr(e.first_in) : "",
+        "יציאה": e.last_out ? timeStr(e.last_out) : ""
+      }));
+      renderTable(qs("previewTable"), previewRows);
+
+      // חישוב
+      const res = computePay(entries, {hourlyRate, travelPerDay, sickMode, fixedSickHours, enableWeekendHoliday, manualHolidays, manualErevHolidays});
+
+      qs("resultsCard").style.display = "block";
+      qs("mWorkdays").textContent = fmtNum(res.metrics.workdays);
+      qs("mSickdays").textContent = fmtNum(res.metrics.sickdays);
+      qs("mSickHours").textContent = fmtNum(res.metrics.sickHoursPerDay);
+      qs("mGross").textContent = fmtNum(res.metrics.gross);
+
+      // טבלאות
+      const dailyRows = res.perDay.map(r=>({
+        "תאריך": toHebDate(r["תאריך"]), "יום": r["יום"], "סטטוס": r["סטטוס"],
+        "כניסה": r["כניסה"], "יציאה": r["יציאה"],
+        "זוהה חג": r["זוהה_חג"], "זוהה ערב חג": r["זוהה_ערב_חג"],
+        "רגיל": r["רגיל"], "ערב (+20%)": r["ערב"], "לילה (+30%)": r["לילה"], "שבת/חג (+50%)": r["שבת_חג"], "סך שעות": r["סהכ_שעות"]
+      }));
+      renderTable(qs("dailyTable"), dailyRows);
+      renderTable(qs("summaryTable"), res.summaryRows);
+
+      // הורדות
+      qs("dlDaily").onclick = ()=> downloadFile("timesheet_per_day.csv", res.dl.dailyCsv);
+      qs("dlSummary").onclick = ()=> downloadFile("shift_summary.csv", res.dl.summaryCsv);
+
+    } catch(err){
+      console.error(err);
+      alert("שגיאה בניתוח: " + err.message);
+    }
+  });
+</script>
+</body>
+</html>
